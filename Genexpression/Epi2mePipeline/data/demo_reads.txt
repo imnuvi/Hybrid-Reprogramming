@@ -1,0 +1,1 @@
+./data/wf-single-cell-demo/chr17.fq.gz

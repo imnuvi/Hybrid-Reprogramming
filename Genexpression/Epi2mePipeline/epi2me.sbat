@@ -31,4 +31,4 @@ module load singularity
 nextflow config
 
 
-sh ./Genexpression/Epi2mePipeline/Epi2MeRunner.sh ./Genexpression/Epi2mePipeline/epi2me.conf
+sh ./Epi2MeRunner.sh ./epi2me.conf
