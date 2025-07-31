@@ -52,8 +52,8 @@ import os
 import json
 
 from skimage import io
-from btrack import datasets
-import btrack
+# from btrack import datasets
+# import btrack
 import tifffile
 import napari
 
@@ -765,44 +765,43 @@ def run_experiment(path, sample, sampleid, noisemap, t1=0, t2=10, save_counts=Fa
 
 # # Running the experiment
 
-# In[118]:
+if __name__ == "__main__":
 
-
-taggfp_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_TaGGFP.tif'
-
-taggfp_noise = tifffile.imread(taggfp_noisemap)
-
-mkate_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_mKate.tif'
-
-mkate_noise = tifffile.imread(mkate_noisemap)
-
-cy5_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_Cy5.tif'
-
-cy5_noise = tifffile.imread(cy5_noisemap)
-
-
-noisemap = {'TaGGFP': taggfp_noise, 'mKate': mkate_noise, 'Cy5': cy5_noise}
-
-
-# In[119]:
-
-
-path = '/scratch/indikar_root/indikar1/shared_data/HYB/kaggle_dataset/datasets/thedoodler/hybrid-imaging-and-genex-dataset-hyb-imagen/versions/3'
-
-
-starttime = 1
-endtime = 190
-
-run_experiment(path, 'Myod', 1, noisemap, 0, endtime)
-run_experiment(path, 'Myod', 2, noisemap, 0, endtime)
-run_experiment(path, 'PRRX1', 1, noisemap, 0, endtime)
-run_experiment(path, 'PRRX1', 2, noisemap, 0, endtime)
-run_experiment(path, 'Myod_PRRX1', 1, noisemap, 0, endtime)
-run_experiment(path, 'Myod_PRRX1', 2, noisemap, 0, endtime)
-run_experiment(path, 'Myod_PRRX1', 3, noisemap, 0, endtime)
-run_experiment(path, 'Negative_Controls', 1, noisemap, 0, endtime)
-run_experiment(path, 'Negative_Controls', 2, noisemap, 0, endtime)
-run_experiment(path, 'Negative_Controls', 3, noisemap, 0, endtime)
+    taggfp_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_TaGGFP.tif'
+    
+    taggfp_noise = tifffile.imread(taggfp_noisemap)
+    
+    mkate_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_mKate.tif'
+    
+    mkate_noise = tifffile.imread(mkate_noisemap)
+    
+    cy5_noisemap = f'/nfs/turbo/umms-indikar/Ram/projects/reprogramming/Image_analysis/process_data/background_images_raw_Cy5.tif'
+    
+    cy5_noise = tifffile.imread(cy5_noisemap)
+    
+    
+    noisemap = {'TaGGFP': taggfp_noise, 'mKate': mkate_noise, 'Cy5': cy5_noise}
+    
+    
+    # In[119]:
+    
+    
+    path = '/scratch/indikar_root/indikar1/shared_data/HYB/kaggle_dataset/datasets/thedoodler/hybrid-imaging-and-genex-dataset-hyb-imagen/versions/3'
+    
+    
+    starttime = 1
+    endtime = 190
+    
+    run_experiment(path, 'Myod', 1, noisemap, 0, endtime)
+    run_experiment(path, 'Myod', 2, noisemap, 0, endtime)
+    run_experiment(path, 'PRRX1', 1, noisemap, 0, endtime)
+    run_experiment(path, 'PRRX1', 2, noisemap, 0, endtime)
+    run_experiment(path, 'Myod_PRRX1', 1, noisemap, 0, endtime)
+    run_experiment(path, 'Myod_PRRX1', 2, noisemap, 0, endtime)
+    run_experiment(path, 'Myod_PRRX1', 3, noisemap, 0, endtime)
+    run_experiment(path, 'Negative_Controls', 1, noisemap, 0, endtime)
+    run_experiment(path, 'Negative_Controls', 2, noisemap, 0, endtime)
+    run_experiment(path, 'Negative_Controls', 3, noisemap, 0, endtime)
 
 
 # ### Loading from raw czi file
