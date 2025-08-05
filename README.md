@@ -6,7 +6,7 @@ Code is split into Gene expression and image analysis
 
 
 
-Image analysis workflow:
+__Image analysis workflow:__
 - Extraction : Specific part of the image across Time, Scene, Mosaic are extracted
 - Clipping and Scaling : The 98th percentile values from the (x, y) shaped matrix are obtained for each channel and rest of the values are clipped to get normalized values. These values are then scaled between 0 - 1.
 - Stacking : MKate and TagGFP channels are stacked on each other to get the phase transitions from G1 - S phase
@@ -16,7 +16,7 @@ Image analysis workflow:
 - Segment mapping : Based on the algorithm, normalize any value in the result to 1 everything else to 0 to create a solid mask image
 - Tracking : Bayesian tracking on the segmented objects works by comparing each cell and assigning a probability of movement, calculated based on metrics like centroid and mass
 
-Gene Expression workflow:
+__Gene Expression workflow:__
 - Cells are tagged with three experimental condition barcodes
 	- Activation of MYOD1
 	- Suppression of PRRX1
@@ -28,3 +28,22 @@ Gene Expression workflow:
 - Trajectory inference is run to place cells on pseudotime and visualized.
 
 
+__Modality Coupling__
+- We can couple both the Imaging and gene expression modality.
+- All code is provided in the HYPED.ipynb
+
+
+__Image Segmentation__
+- Cells can be segmented based on the pipeline provided in Imaging/image_processing.py
+- Each channel has it's own background noise map, provided in data/imaging/noise_maps
+    - This noise can be removed by removing it for each mosaic tile in the Imaging dataset.
+
+
+![Segmentation Sample](figures/frame_image_segmentation.png)
+ 
+__Image Tracking__
+- Using the segmentation for each cell, we can track the cells across each frame.
+- This is performed using Btrack, which creates and optimizes the tracks based on morphology data of each cell.
+- The tracks generated can be viewed in Napari viewer directly
+
+![Segmentation Sample](figures/frame_image_segmentation.png)
