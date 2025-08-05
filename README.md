@@ -38,12 +38,8 @@ __Image Segmentation__
 - Each channel has it's own background noise map, provided in data/imaging/noise_maps
     - This noise can be removed by removing it for each mosaic tile in the Imaging dataset.
 
-
-![Segmentation Sample](figures/frame_image_segmentation.png)
  
 __Image Tracking__
 - Using the segmentation for each cell, we can track the cells across each frame.
 - This is performed using Btrack, which creates and optimizes the tracks based on morphology data of each cell.
 - The tracks generated can be viewed in Napari viewer directly
-
-![Segmentation Sample](figures/tracked_images.mp4)
