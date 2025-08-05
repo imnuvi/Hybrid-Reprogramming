@@ -46,4 +46,4 @@ __Image Tracking__
 - This is performed using Btrack, which creates and optimizes the tracks based on morphology data of each cell.
 - The tracks generated can be viewed in Napari viewer directly
 
-![Segmentation Sample](figures/frame_image_segmentation.png)
+![Segmentation Sample](figures/tracked_images.mp4)
