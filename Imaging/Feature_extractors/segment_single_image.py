@@ -23,6 +23,7 @@ from csbdeep.utils import normalize
 from skimage.color import rgb2gray
 from skimage.measure import regionprops, regionprops_table
 from stardist.models import StarDist2D
+import tifffile
 
 
 def _parse_channel_list(value):
@@ -266,6 +267,220 @@ def _append_crops_zarr(out_zarr, image, df, info, frame_id=0, crop_size=64, crop
     df["crop_id"] = crop_ids
     df["crop_store"] = str(out_zarr)
     df["crop_dataset"] = "crops"
+    return df
+
+
+def write_label_tiff(out_mask, labels, info, frame_id=0, seg_channel_name=None, out_csv=None):
+    """Write a StarDist label image as a reloadable TIFF and return its path."""
+    if out_mask is None or out_mask is False:
+        return None
+    if str(out_mask).lower() == "auto":
+        if out_csv is None:
+            raise ValueError("out_csv is required when out_mask='auto'.")
+        out_csv_path = Path(out_csv)
+        out_mask = out_csv_path.with_name(f"{out_csv_path.stem}_labels.tif")
+
+    out_mask = Path(out_mask)
+    out_mask.parent.mkdir(parents=True, exist_ok=True)
+    label_max = int(np.nanmax(labels)) if labels.size else 0
+    dtype = np.uint16 if label_max <= np.iinfo(np.uint16).max else np.uint32
+    metadata = {
+        "axes": "YX",
+        "mode": "labels",
+        "frame_id": int(frame_id),
+        "seg_channel_name": str(seg_channel_name) if seg_channel_name is not None else "",
+        "source_feature_csv": str(out_csv) if out_csv is not None else "",
+        "label_semantics": "Pixel values match the `label` and `mask_label_value` columns in the feature CSV.",
+    }
+    if isinstance(info, dict):
+        px = info.get("physical_pixel_size", {})
+        origin = info.get("origin", {})
+        metadata.update({
+            "physical_pixel_size_x": px.get("X", ""),
+            "physical_pixel_size_y": px.get("Y", ""),
+            "physical_pixel_size_unit": px.get("X_unit", px.get("unit", "")),
+            "origin_x": origin.get("X", ""),
+            "origin_y": origin.get("Y", ""),
+            "origin_unit": origin.get("unit", ""),
+        })
+
+    tifffile.imwrite(out_mask, labels.astype(dtype, copy=False), metadata=metadata)
+    return str(out_mask)
+
+
+def segment_image_to_labels(
+    image,
+    info,
+    stardist_model="2D_versatile_fluo",
+    segment_channel="Cy5",
+    prob_thresh=0.45,
+    nms_thresh=0.2,
+):
+    """Segment one multi-channel image and return ``(labels, seg_idx, seg_name)``."""
+    image = np.asarray(image)
+    if image.ndim == 3:
+        pass
+    elif image.ndim != 4:
+        raise ValueError(f"Expected image shape (C, Y, X) or (C, Y, X, 3); got {image.shape}")
+
+    ch_names = info.get("channels", [])
+    seg_idx = resolve_channel_index(segment_channel, info)
+    seg_name = ch_names[seg_idx] if seg_idx < len(ch_names) else f"Channel-{seg_idx}"
+    C = image.shape[0]
+    if not (0 <= seg_idx < C):
+        raise IndexError(f"Channel index {seg_idx} out of range [0, {C - 1}]")
+
+    model = StarDist2D.from_pretrained(stardist_model)
+    raw_seg = _as_gray(image[seg_idx])
+    labels, _ = model.predict_instances(
+        normalize(raw_seg),
+        prob_thresh=prob_thresh,
+        nms_thresh=nms_thresh,
+    )
+    return labels.astype(np.int32, copy=False), seg_idx, seg_name
+
+
+def extract_features_from_labels_to_csv(
+    image,
+    labels,
+    info,
+    out_csv,
+    mask_file=None,
+    segment_channel="Cy5",
+    summarize_channels="all",
+    extract_extended_features=True,
+    brightfield_channel=None,
+    oblique_channel=None,
+    oblique_tile_size=34,
+    crop_size=32,
+    neighborhood_radii=(50, 100),
+    include_raw_crops=False,
+    out_crops=None,
+    out_zarr=None,
+    crop_channels="all",
+    frame_id=0,
+):
+    """Extract per-cell features from saved stitched-channel images and labels."""
+    image = np.asarray(image)
+    labels = np.asarray(labels)
+    if labels.ndim != 2:
+        raise ValueError(f"Expected 2D label mask; got {labels.shape}")
+    if image.ndim not in (3, 4):
+        raise ValueError(f"Expected image shape (C, Y, X) or (C, Y, X, 3); got {image.shape}")
+    if image.shape[-2:] != labels.shape and image.ndim == 3:
+        raise ValueError(f"Image YX shape {image.shape[-2:]} does not match labels {labels.shape}")
+    if image.ndim == 4 and image.shape[1:3] != labels.shape:
+        raise ValueError(f"Image YX shape {image.shape[1:3]} does not match labels {labels.shape}")
+
+    ch_names = info.get("channels", [])
+
+    def _to_idx(ch):
+        if isinstance(ch, str):
+            stripped = ch.strip()
+            try:
+                return int(stripped)
+            except ValueError:
+                return ch_names.index(stripped)
+        return int(ch)
+
+    seg_idx = resolve_channel_index(segment_channel, info)
+    seg_name = ch_names[seg_idx] if seg_idx < len(ch_names) else f"Channel-{seg_idx}"
+
+    if summarize_channels == "all":
+        sum_idx = list(range(image.shape[0]))
+    else:
+        summarize_channels = _parse_channel_list(summarize_channels)
+        sum_idx = [_to_idx(c) for c in summarize_channels]
+    if seg_idx not in sum_idx:
+        sum_idx = [seg_idx] + sum_idx
+
+    sx = float(info["physical_pixel_size"]["X"])
+    sy = float(info["physical_pixel_size"]["Y"])
+    ox = float(info["origin"]["X"])
+    oy = float(info["origin"]["Y"])
+    unit_px = info["physical_pixel_size"].get("X_unit", "um")
+    unit_org = info["origin"].get("unit", "um")
+    if unit_px != unit_org:
+        raise ValueError("Pixel-size and origin units differ; convert first.")
+
+    raw_seg = _as_gray(image[seg_idx])
+    supported_props = _probe_supported_props(labels, intensity_image=raw_seg)
+    main_props = regionprops_table(
+        labels,
+        intensity_image=raw_seg,
+        properties=supported_props + ["mean_intensity", "max_intensity", "min_intensity"],
+    )
+    df = pd.DataFrame(main_props)
+
+    if not df.empty:
+        df["centroid_x_px"] = df["centroid-1"]
+        df["centroid_y_px"] = df["centroid-0"]
+        df["centroid_x_um"] = ox + df["centroid_x_px"] * sx
+        df["centroid_y_um"] = oy + df["centroid_y_px"] * sy
+        df["centroid_unit"] = unit_org
+
+        df.rename(
+            columns={
+                "mean_intensity": f"{seg_name}_mean",
+                "max_intensity": f"{seg_name}_max",
+                "min_intensity": f"{seg_name}_min",
+            },
+            inplace=True,
+        )
+        df[f"{seg_name}_sum"] = df[f"{seg_name}_mean"] * df["area"]
+
+        for c in sum_idx:
+            if c == seg_idx:
+                continue
+            raw_c = _as_gray(image[c])
+            ch_label = ch_names[c] if c < len(ch_names) else f"Channel-{c}"
+            add = regionprops_table(
+                labels,
+                intensity_image=raw_c,
+                properties=["label", "mean_intensity", "max_intensity", "min_intensity"],
+            )
+            add = pd.DataFrame(add).rename(
+                columns={
+                    "mean_intensity": f"{ch_label}_mean",
+                    "max_intensity": f"{ch_label}_max",
+                    "min_intensity": f"{ch_label}_min",
+                }
+            )
+            add[f"{ch_label}_sum"] = add[f"{ch_label}_mean"] * df["area"]
+            df = df.merge(add, on="label", how="left")
+
+        df["time"] = int(frame_id)
+        df["frame_id"] = int(frame_id)
+        df["seg_channel_idx"] = seg_idx
+        df["seg_channel_name"] = seg_name
+        df["mask_file"] = str(mask_file) if mask_file is not None else None
+        df["mask_label_value"] = df["label"].astype(int)
+
+        if extract_extended_features:
+            df = _add_extended_features(
+                df=df,
+                labels=labels,
+                image=image,
+                info=info,
+                seg_idx=seg_idx,
+                sum_idx=sum_idx,
+                brightfield_channel=brightfield_channel,
+                oblique_channel=oblique_channel,
+                oblique_tile_size=oblique_tile_size,
+                crop_size=crop_size,
+                neighborhood_radii=neighborhood_radii,
+                include_raw_crops=include_raw_crops,
+            )
+
+    if out_crops is not None:
+        df = _write_crops_npz(out_crops, image, df, info, crop_size, crop_channels)
+
+    if out_zarr is not None:
+        df = _append_crops_zarr(out_zarr, image, df, info, frame_id, crop_size, crop_channels)
+
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
     return df
 
 
@@ -589,6 +804,7 @@ def segment_single_image_to_csv(
     image,
     info,
     out_csv,
+    out_mask="auto",
     stardist_model="2D_versatile_fluo",
     segment_channel="Cy5",
     prob_thresh=0.45,
@@ -617,6 +833,11 @@ def segment_single_image_to_csv(
         ``get_metadata.py`` script.
     out_csv : str or pathlib.Path
         Destination for the region-properties CSV.
+    out_mask : str or pathlib.Path, optional
+        Destination for the label-mask TIFF.  ``"auto"`` writes beside
+        ``out_csv`` as ``{out_csv.stem}_labels.tif``. Pixel values are the
+        segmentation labels and match ``label``/``mask_label_value`` in the
+        output CSV.
     extract_extended_features : bool
         If true, append morphology, texture, boundary-Fourier, neighborhood,
         robust per-channel intensity, and fixed-crop summary features.
@@ -703,6 +924,14 @@ def segment_single_image_to_csv(
         properties=supported_props + ["mean_intensity", "max_intensity", "min_intensity"],
     )
     df = pd.DataFrame(main_props)
+    mask_path = write_label_tiff(
+        out_mask=out_mask,
+        labels=labels,
+        info=info,
+        frame_id=frame_id,
+        seg_channel_name=seg_name,
+        out_csv=out_csv,
+    )
 
     if not df.empty:
         df["centroid_x_px"] = df["centroid-1"]
@@ -745,6 +974,8 @@ def segment_single_image_to_csv(
         df["frame_id"] = int(frame_id)
         df["seg_channel_idx"] = seg_idx
         df["seg_channel_name"] = seg_name
+        df["mask_file"] = mask_path
+        df["mask_label_value"] = df["label"].astype(int)
 
         if extract_extended_features:
             df = _add_extended_features(
@@ -801,6 +1032,7 @@ def main():
     parser.add_argument("--image", required=True, help="Path to .npy array shaped (C, Y, X) or (C, Y, X, 3)")
     parser.add_argument("--meta", required=True, help="Path to metadata JSON")
     parser.add_argument("--out-csv", required=True)
+    parser.add_argument("--out-mask", default="auto", help="Label-mask TIFF path, or 'auto' to write beside --out-csv.")
     parser.add_argument("--model-info", default="2D_versatile_fluo")
     parser.add_argument("--segment-channel", default="Cy5")
     parser.add_argument("--prob-thresh", type=float, default=0.45)
@@ -827,6 +1059,7 @@ def main():
         image=image,
         info=info,
         out_csv=args.out_csv,
+        out_mask=args.out_mask,
         stardist_model=args.model_info,
         segment_channel=args.segment_channel,
         prob_thresh=args.prob_thresh,

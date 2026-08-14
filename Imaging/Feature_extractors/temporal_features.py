@@ -260,6 +260,178 @@ def link_cell_tracks(
     return df, pd.DataFrame(division_relations)
 
 
+def _load_segmentation_stack_from_observations(observations):
+    """Load one saved label-mask TIFF per frame from the feature table."""
+    if "mask_file" not in observations:
+        raise ValueError("Btrack backend requires a `mask_file` column. Run segmentation with `out_mask` first.")
+
+    try:
+        import tifffile
+    except Exception as exc:
+        raise ImportError("Btrack-from-mask tracking requires `tifffile`.") from exc
+
+    frame_paths = (
+        observations[["frame_id", "mask_file"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values("frame_id")
+    )
+    if frame_paths.empty:
+        raise ValueError("Btrack backend could not find any non-empty `mask_file` entries.")
+    if frame_paths["frame_id"].duplicated().any():
+        dupes = frame_paths.loc[frame_paths["frame_id"].duplicated(), "frame_id"].tolist()
+        raise ValueError(f"Each frame must map to exactly one mask_file for Btrack. Duplicates: {dupes[:5]}")
+
+    masks = []
+    frame_to_btrack_t = {}
+    for bt, row in enumerate(frame_paths.itertuples(index=False)):
+        path = Path(row.mask_file)
+        if not path.exists():
+            raise FileNotFoundError(f"Segmentation mask not found for frame {row.frame_id}: {path}")
+        masks.append(tifffile.imread(path))
+        frame_to_btrack_t[int(row.frame_id)] = bt
+    return np.stack(masks, axis=0), frame_to_btrack_t
+
+
+def _extract_btrack_track_rows(tracks):
+    """Convert Btrack tracklets to a plain DataFrame across btrack versions."""
+    rows = []
+    for track in tracks:
+        tid = getattr(track, "ID", getattr(track, "id", np.nan))
+        parent = getattr(track, "parent", np.nan)
+        root = getattr(track, "root", np.nan)
+        generation = getattr(track, "generation", np.nan)
+        t_vals = np.asarray(getattr(track, "t", []))
+        x_vals = np.asarray(getattr(track, "x", []))
+        y_vals = np.asarray(getattr(track, "y", []))
+        for t, x, y in zip(t_vals, x_vals, y_vals):
+            rows.append({
+                "btrack_t": int(t),
+                "track_id": int(tid) if pd.notna(tid) else np.nan,
+                "parent_track_id": int(parent) if pd.notna(parent) and int(parent) > 0 else pd.NA,
+                "lineage_id": int(root) if pd.notna(root) and int(root) > 0 else (int(tid) if pd.notna(tid) else np.nan),
+                "generation": int(generation) if pd.notna(generation) else 0,
+                "btrack_x_px": float(x),
+                "btrack_y_px": float(y),
+            })
+    return pd.DataFrame(rows)
+
+
+def _configure_btrack(tracker, config_file=None, max_search_radius=50, tracking_updates=("MOTION", "VISUAL"), features=None, volume=None):
+    """Apply Btrack settings without assuming every install exposes every property."""
+    if config_file is not None:
+        tracker.configure(str(config_file))
+    if max_search_radius is not None:
+        tracker.max_search_radius = max_search_radius
+    if tracking_updates is not None:
+        tracker.tracking_updates = list(tracking_updates)
+    if features:
+        tracker.features = list(features)
+    if volume is not None:
+        tracker.volume = volume
+
+
+def link_cell_tracks_btrack(
+    observations,
+    config_file=None,
+    features=("area", "major_axis_length", "minor_axis_length", "orientation", "solidity", "eccentricity"),
+    max_search_radius=50,
+    tracking_updates=("MOTION", "VISUAL"),
+    volume=None,
+    step_size=100,
+    optimize=True,
+    num_workers=1,
+    assignment_max_distance_px=5.0,
+):
+    """Link cells with Btrack using saved segmentation masks, then map tracks to rows.
+
+    Btrack operates on the label-mask stack.  We map its track output back onto
+    the feature table by matching frame and nearest centroid in pixel space.
+    """
+    try:
+        import btrack
+    except Exception as exc:
+        raise ImportError("tracking_backend='btrack' requires the optional `btrack` package.") from exc
+
+    df = observations.copy().reset_index(drop=True)
+    if df.empty:
+        for c in ["track_id", "parent_track_id", "lineage_id", "generation"]:
+            df[c] = pd.Series(dtype="Int64")
+        return df, pd.DataFrame()
+
+    segmentation, frame_to_btrack_t = _load_segmentation_stack_from_observations(df)
+    valid_features = tuple(c for c in (features or ()) if c in df.columns)
+    objects = btrack.utils.segmentation_to_objects(
+        segmentation,
+        properties=valid_features,
+        num_workers=int(num_workers),
+    )
+
+    if volume is None:
+        volume = ((0, segmentation.shape[2]), (0, segmentation.shape[1]))
+
+    with btrack.BayesianTracker() as tracker:
+        _configure_btrack(
+            tracker,
+            config_file=config_file,
+            max_search_radius=max_search_radius,
+            tracking_updates=tracking_updates,
+            features=valid_features,
+            volume=volume,
+        )
+        tracker.append(objects)
+        tracker.track(step_size=step_size)
+        if optimize:
+            tracker.optimize()
+        track_rows = _extract_btrack_track_rows(tracker.tracks)
+
+    if track_rows.empty:
+        raise RuntimeError("Btrack returned no tracks.")
+
+    df["btrack_t"] = df["frame_id"].map(frame_to_btrack_t).astype(int)
+    assignments = {}
+    for bt, obs_idx in df.groupby("btrack_t", sort=False).groups.items():
+        obs_idx = list(obs_idx)
+        trs = track_rows[track_rows["btrack_t"] == int(bt)].copy()
+        if trs.empty:
+            continue
+        obs_xy = df.loc[obs_idx, ["centroid_x_px", "centroid_y_px"]].to_numpy(float)
+        tr_xy = trs[["btrack_x_px", "btrack_y_px"]].to_numpy(float)
+        cost = np.sqrt(((obs_xy[:, None, :] - tr_xy[None, :, :]) ** 2).sum(axis=2))
+        rr, cc = linear_sum_assignment(cost)
+        for r, c in zip(rr, cc):
+            dist = float(cost[r, c])
+            if dist <= float(assignment_max_distance_px):
+                assignments[obs_idx[r]] = (trs.iloc[c].to_dict(), dist)
+
+    missing = sorted(set(df.index).difference(assignments))
+    if missing:
+        raise RuntimeError(
+            f"Btrack mapping left {len(missing)} feature rows unmatched. "
+            "Increase assignment_max_distance_px or inspect mask/CSV centroid consistency."
+        )
+
+    df["track_id"] = pd.array([assignments[i][0]["track_id"] for i in df.index], dtype="Int64")
+    df["parent_track_id"] = pd.array([assignments[i][0]["parent_track_id"] for i in df.index], dtype="Int64")
+    df["lineage_id"] = pd.array([assignments[i][0]["lineage_id"] for i in df.index], dtype="Int64")
+    df["generation"] = pd.array([assignments[i][0]["generation"] for i in df.index], dtype="Int64")
+    df["link_type"] = "btrack"
+    df["tracking_confidence"] = np.nan
+    df["link_distance_um"] = np.nan
+    df["btrack_assignment_distance_px"] = [assignments[i][1] for i in df.index]
+    df = df.sort_values(["track_id", "elapsed_time", "frame_id"]).copy()
+    df["gap_frames"] = (
+        df.groupby("track_id")["frame_id"]
+        .diff()
+        .sub(1)
+        .clip(lower=0)
+        .fillna(0)
+        .astype(int)
+    )
+    df["is_interpolated"] = False
+    return df.sort_index(), pd.DataFrame()
+
+
 def add_temporal_features(
     tracked,
     temporal_columns=None,
@@ -448,6 +620,7 @@ def build_temporal_tables(
     rolling_windows=(3.0, 6.0, 12.0),
     msd_lags=(1, 2, 3, 5),
     stationary_speed_threshold=1.0,
+    tracking_backend="simple",
     tracking_kwargs=None,
     output_dir=None,
 ):
@@ -457,7 +630,13 @@ def build_temporal_tables(
     else:
         combined = pd.concat(list(frame_tables), ignore_index=True, sort=False)
     prepared = _prepare_observations(combined, frame_interval, time_unit, timestamps)
-    tracked, divisions = link_cell_tracks(prepared, **(tracking_kwargs or {}))
+    backend = str(tracking_backend).lower()
+    if backend in {"simple", "centroid", "linear_sum_assignment"}:
+        tracked, divisions = link_cell_tracks(prepared, **(tracking_kwargs or {}))
+    elif backend in {"btrack", "bayesian"}:
+        tracked, divisions = link_cell_tracks_btrack(prepared, **(tracking_kwargs or {}))
+    else:
+        raise ValueError("tracking_backend must be one of: 'simple', 'centroid', or 'btrack'.")
     observations = add_temporal_features(
         tracked, temporal_columns, rolling_windows, msd_lags, stationary_speed_threshold,
     )
@@ -487,4 +666,3 @@ def build_temporal_tables(
         tracks.to_csv(out / "track_summaries.csv", index=False)
         events.to_csv(out / "lineage_events.csv", index=False)
     return observations, tracks, events
-
