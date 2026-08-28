@@ -283,14 +283,17 @@ def _load_segmentation_stack_from_observations(observations):
         raise ValueError(f"Each frame must map to exactly one mask_file for Btrack. Duplicates: {dupes[:5]}")
 
     masks = []
+    mask_by_btrack_t = {}
     frame_to_btrack_t = {}
     for bt, row in enumerate(frame_paths.itertuples(index=False)):
         path = Path(row.mask_file)
         if not path.exists():
             raise FileNotFoundError(f"Segmentation mask not found for frame {row.frame_id}: {path}")
-        masks.append(tifffile.imread(path))
+        mask = tifffile.imread(path)
+        masks.append(mask)
+        mask_by_btrack_t[bt] = mask
         frame_to_btrack_t[int(row.frame_id)] = bt
-    return np.stack(masks, axis=0), frame_to_btrack_t
+    return np.stack(masks, axis=0), frame_to_btrack_t, mask_by_btrack_t
 
 
 def _extract_btrack_track_rows(tracks):
@@ -317,10 +320,23 @@ def _extract_btrack_track_rows(tracks):
     return pd.DataFrame(rows)
 
 
-def _configure_btrack(tracker, config_file=None, max_search_radius=50, tracking_updates=("MOTION", "VISUAL"), features=None, volume=None):
+def _resolve_btrack_config(btrack, config_file):
+    """Return a Btrack config path, using the packaged cell config by default."""
+    if config_file not in (None, "", "auto"):
+        return config_file
+    try:
+        return btrack.datasets.cell_config()
+    except Exception as exc:
+        raise RuntimeError(
+            "Btrack needs a tracker configuration. Pass --btrack-config /path/to/cell_config.json "
+            "or install btrack with its example datasets so btrack.datasets.cell_config() is available."
+        ) from exc
+
+
+def _configure_btrack(btrack, tracker, config_file=None, max_search_radius=50, tracking_updates=("MOTION", "VISUAL"), features=None, volume=None):
     """Apply Btrack settings without assuming every install exposes every property."""
-    if config_file is not None:
-        tracker.configure(str(config_file))
+    resolved_config = _resolve_btrack_config(btrack, config_file)
+    tracker.configure(str(resolved_config))
     if max_search_radius is not None:
         tracker.max_search_radius = max_search_radius
     if tracking_updates is not None:
@@ -342,11 +358,15 @@ def link_cell_tracks_btrack(
     optimize=True,
     num_workers=1,
     assignment_max_distance_px=5.0,
+    unmatched_policy="singleton",
 ):
     """Link cells with Btrack using saved segmentation masks, then map tracks to rows.
 
     Btrack operates on the label-mask stack.  We map its track output back onto
-    the feature table by matching frame and nearest centroid in pixel space.
+    the feature table by reading the label value at each Btrack centroid, then
+    falling back to nearest centroid in pixel space. Btrack may mark some
+    detections as false positives during optimization; by default those rows are
+    preserved as singleton tracks instead of being dropped.
     """
     try:
         import btrack
@@ -359,7 +379,7 @@ def link_cell_tracks_btrack(
             df[c] = pd.Series(dtype="Int64")
         return df, pd.DataFrame()
 
-    segmentation, frame_to_btrack_t = _load_segmentation_stack_from_observations(df)
+    segmentation, frame_to_btrack_t, mask_by_btrack_t = _load_segmentation_stack_from_observations(df)
     valid_features = tuple(c for c in (features or ()) if c in df.columns)
     objects = btrack.utils.segmentation_to_objects(
         segmentation,
@@ -372,6 +392,7 @@ def link_cell_tracks_btrack(
 
     with btrack.BayesianTracker() as tracker:
         _configure_btrack(
+            btrack,
             tracker,
             config_file=config_file,
             max_search_radius=max_search_radius,
@@ -390,32 +411,78 @@ def link_cell_tracks_btrack(
 
     df["btrack_t"] = df["frame_id"].map(frame_to_btrack_t).astype(int)
     assignments = {}
+    row_lookup = {}
+    label_col = "mask_label_value" if "mask_label_value" in df.columns else "label"
+    for row_idx, row in df.iterrows():
+        row_lookup[(int(row["btrack_t"]), int(row[label_col]))] = row_idx
+
     for bt, obs_idx in df.groupby("btrack_t", sort=False).groups.items():
         obs_idx = list(obs_idx)
         trs = track_rows[track_rows["btrack_t"] == int(bt)].copy()
         if trs.empty:
             continue
-        obs_xy = df.loc[obs_idx, ["centroid_x_px", "centroid_y_px"]].to_numpy(float)
+        used_track_rows = set()
+        mask = mask_by_btrack_t.get(int(bt))
+        if mask is not None:
+            for tr_pos, (_, tr) in enumerate(trs.iterrows()):
+                y = int(round(float(tr["btrack_y_px"])))
+                x = int(round(float(tr["btrack_x_px"])))
+                if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:
+                    label = int(mask[y, x])
+                    row_idx = row_lookup.get((int(bt), label))
+                    if label > 0 and row_idx is not None and row_idx not in assignments:
+                        assignments[row_idx] = (tr.to_dict(), 0.0)
+                        used_track_rows.add(tr_pos)
+
+        unmatched_obs_idx = [idx for idx in obs_idx if idx not in assignments]
+        if not unmatched_obs_idx:
+            continue
+        trs = trs.reset_index(drop=True).drop(index=list(used_track_rows), errors="ignore")
+        if trs.empty:
+            continue
+        obs_xy = df.loc[unmatched_obs_idx, ["centroid_x_px", "centroid_y_px"]].to_numpy(float)
         tr_xy = trs[["btrack_x_px", "btrack_y_px"]].to_numpy(float)
         cost = np.sqrt(((obs_xy[:, None, :] - tr_xy[None, :, :]) ** 2).sum(axis=2))
         rr, cc = linear_sum_assignment(cost)
         for r, c in zip(rr, cc):
             dist = float(cost[r, c])
             if dist <= float(assignment_max_distance_px):
-                assignments[obs_idx[r]] = (trs.iloc[c].to_dict(), dist)
+                assignments[unmatched_obs_idx[r]] = (trs.iloc[c].to_dict(), dist)
 
     missing = sorted(set(df.index).difference(assignments))
     if missing:
-        raise RuntimeError(
-            f"Btrack mapping left {len(missing)} feature rows unmatched. "
-            "Increase assignment_max_distance_px or inspect mask/CSV centroid consistency."
-        )
+        policy = str(unmatched_policy).lower()
+        if policy == "error":
+            raise RuntimeError(
+                f"Btrack mapping left {len(missing)} feature rows unmatched. "
+                "Increase assignment_max_distance_px, use --btrack-unmatched-policy singleton, "
+                "or inspect mask/CSV centroid consistency."
+            )
+        if policy not in {"singleton", "keep"}:
+            raise ValueError("unmatched_policy must be one of: 'singleton', 'keep', or 'error'.")
+        next_track_id = int(track_rows["track_id"].max()) + 1
+        for row_idx in missing:
+            if policy == "singleton":
+                assignments[row_idx] = ({
+                    "track_id": next_track_id,
+                    "parent_track_id": pd.NA,
+                    "lineage_id": next_track_id,
+                    "generation": 0,
+                }, np.nan)
+                next_track_id += 1
+            else:
+                assignments[row_idx] = ({
+                    "track_id": pd.NA,
+                    "parent_track_id": pd.NA,
+                    "lineage_id": pd.NA,
+                    "generation": pd.NA,
+                }, np.nan)
 
     df["track_id"] = pd.array([assignments[i][0]["track_id"] for i in df.index], dtype="Int64")
     df["parent_track_id"] = pd.array([assignments[i][0]["parent_track_id"] for i in df.index], dtype="Int64")
     df["lineage_id"] = pd.array([assignments[i][0]["lineage_id"] for i in df.index], dtype="Int64")
     df["generation"] = pd.array([assignments[i][0]["generation"] for i in df.index], dtype="Int64")
-    df["link_type"] = "btrack"
+    df["link_type"] = ["btrack_unmatched" if i in missing else "btrack" for i in df.index]
     df["tracking_confidence"] = np.nan
     df["link_distance_um"] = np.nan
     df["btrack_assignment_distance_px"] = [assignments[i][1] for i in df.index]

@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--btrack-max-search-radius", type=float, default=50.0)
     parser.add_argument("--btrack-num-workers", type=int, default=1)
     parser.add_argument("--btrack-assignment-max-distance-px", type=float, default=5.0)
+    parser.add_argument("--btrack-unmatched-policy", default="singleton", choices=["singleton", "keep", "error"])
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -111,6 +112,7 @@ def main():
                 "max_search_radius": args.btrack_max_search_radius,
                 "num_workers": args.btrack_num_workers,
                 "assignment_max_distance_px": args.btrack_assignment_max_distance_px,
+                "unmatched_policy": args.btrack_unmatched_policy,
             }
         temporal_dir = out_dir / "temporal_features"
         build_temporal_tables(
